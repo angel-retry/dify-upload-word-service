@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  dify-upload-service:
+    build: .
+    container_name: dify-upload-word-service
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./storage:/app/storage
+    restart: always
