@@ -20,14 +20,15 @@ app = FastAPI()
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# 維持三分立的資料夾結構，保護原始檔不外洩
+# 精簡為兩個資料夾：
+# - docx：處理後的版本（縮排修正＋自動編號硬寫成文字），同時拿去轉 PDF 跟餵給 Dify，
+#         只保留這一份，不另外保存使用者上傳的未處理原始檔
+# - pdf：僅供瀏覽用的轉檔結果（PDF 網址已寫入 Dify metadata，不需要另存注入 PDF 說明段落的 Word 檔）
 STORAGE_DIR = BASE_DIR / "storage"
-DOCX_ORIGINAL_DIR = STORAGE_DIR / "docx_original"
-DOCX_MODIFIED_DIR = STORAGE_DIR / "docx_modified"
+DOCX_DIR = STORAGE_DIR / "docx"
 PDF_DIR = STORAGE_DIR / "pdf"
 
-DOCX_ORIGINAL_DIR.mkdir(parents=True, exist_ok=True)
-DOCX_MODIFIED_DIR.mkdir(parents=True, exist_ok=True)
+DOCX_DIR.mkdir(parents=True, exist_ok=True)
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 # 僅掛載 PDF 目錄為靜態路由，確保外部無法存取原始 Word 檔
@@ -40,7 +41,7 @@ DIFY_API_KEY = os.getenv("DIFY_API_KEY")
 if not DIFY_API_KEY:
     raise ValueError("未設定 DIFY_API_KEY，請確認 .env 檔案設定。")
 
-# 新增：metadata 欄位 ID 的記憶體快取，不用再手動把 ID 貼進 .env。
+# metadata 欄位 ID 的記憶體快取，不用再手動把 ID 貼進 .env。
 # 第一次用到某個欄位名稱時才會打一次查詢 API，之後同一次程式執行期間直接沿用快取，
 # 不會每次上傳都重打請求。若欄位被刪除重建、快取失效，會自動重新查詢。
 _METADATA_FIELD_CACHE = {}
@@ -164,7 +165,7 @@ def set_document_metadata(dataset_id: str, document_id: str, file_uuid: str, pdf
 
 def get_file_uuid_from_metadata(doc: dict) -> str:
     """
-    新增：嘗試從「取得文件列表」API 回傳的單筆 doc 物件中，
+    嘗試從「取得文件列表」API 回傳的單筆 doc 物件中，
     解析出 file_uuid metadata 的值。
     Dify 的 doc_metadata 欄位常見格式為 list，例如：
     [{"id": "...", "name": "file_uuid", "value": "xxxx-xxxx"}]
@@ -183,6 +184,12 @@ def get_file_uuid_from_metadata(doc: dict) -> str:
 
 # ============================================================
 # 修正 w:leftChars 造成的 LibreOffice 縮排跑版問題（完全保留未動）
+#
+# 執行順序很重要：這個函式一定要在 normalize_and_solidify_list_numbering
+# 之前執行。因為這裡會把每個編號段落該有的 left / hanging 縮排值，
+# 直接寫死到段落自己的 w:ind 上（不依賴 w:numPr 是否還存在）；
+# 之後 normalize_and_solidify_list_numbering 把 w:numPr 移除時，
+# 縮排效果不會跟著消失，排版還是正確的。
 # ============================================================
 def fix_list_indentation_for_libreoffice(doc: docx.Document):
     """
@@ -297,6 +304,216 @@ def fix_list_indentation_for_libreoffice(doc: docx.Document):
     print(f"[縮排修正] 共修正 {fixed_count} 個段落的縮排數值")
 
 
+_ROMAN_TABLE = [
+    (1000, 'M'), (900, 'CM'), (500, 'D'), (400, 'CD'),
+    (100, 'C'), (90, 'XC'), (50, 'L'), (40, 'XL'),
+    (10, 'X'), (9, 'IX'), (5, 'V'), (4, 'IV'), (1, 'I'),
+]
+
+_CHINESE_DIGITS = "〇一二三四五六七八九"
+_HEAVENLY_STEMS = "甲乙丙丁戊己庚辛壬癸"  # 天干，Word 的甲乙丙清單樣式常用這十個字循環
+
+
+def _to_roman(num: int) -> str:
+    result = []
+    for value, symbol in _ROMAN_TABLE:
+        while num >= value:
+            result.append(symbol)
+            num -= value
+    return "".join(result)
+
+
+def _to_letters(num: int) -> str:
+    """1 -> a, 2 -> b, ... 26 -> z, 27 -> aa, 28 -> ab ..."""
+    letters = ""
+    while num > 0:
+        num, remainder = divmod(num - 1, 26)
+        letters = chr(97 + remainder) + letters
+    return letters
+
+
+def _to_chinese_numeral(num: int) -> str:
+    """簡易中文數字轉換，涵蓋清單常見的 1~99 範圍"""
+    if num <= 0:
+        return str(num)
+    if num < 10:
+        return _CHINESE_DIGITS[num]
+    if num < 20:
+        ones = num - 10
+        return "十" + (_CHINESE_DIGITS[ones] if ones else "")
+    tens, ones = divmod(num, 10)
+    result = _CHINESE_DIGITS[tens] + "十"
+    if ones:
+        result += _CHINESE_DIGITS[ones]
+    return result
+
+
+def _to_heavenly_stem(num: int) -> str:
+    """甲乙丙丁...，超過十個循環使用（天干本身只有十個字）"""
+    if num <= 0:
+        return str(num)
+    return _HEAVENLY_STEMS[(num - 1) % len(_HEAVENLY_STEMS)]
+
+
+def _format_counter(num: int, num_fmt: str) -> str:
+    """
+    依 Word 的 w:numFmt 值，把計數轉成對應樣式的文字。
+    涵蓋常見樣式：阿拉伯數字、a/b/c、A/B/C、i/ii/iii、I/II/III、
+    一/二/三（中文計數）、甲/乙/丙（天干）。
+    遇到沒對應到的冷門格式，保守 fallback 成阿拉伯數字，並印出提醒。
+    """
+    if num_fmt in ("decimal", "decimalHalfWidth"):
+        return str(num)
+    if num_fmt == "decimalZero":
+        return f"{num:02d}"
+    if num_fmt == "lowerLetter":
+        return _to_letters(num)
+    if num_fmt == "upperLetter":
+        return _to_letters(num).upper()
+    if num_fmt == "lowerRoman":
+        return _to_roman(num).lower()
+    if num_fmt == "upperRoman":
+        return _to_roman(num)
+    if num_fmt in ("chineseCounting", "chineseCountingThousand", "ideographDigital"):
+        return _to_chinese_numeral(num)
+    if num_fmt in (
+        "taiwaneseCounting", "taiwaneseCountingThousand",
+        "ideographTraditional", "ideographZodiac", "ideographZodiacTraditional",
+        "ideographLegalTraditional",
+    ):
+        return _to_heavenly_stem(num)
+
+    print(f"[編號硬寫] 遇到未特別支援的清單格式 '{num_fmt}'，暫以阿拉伯數字代替。")
+    return str(num)
+
+
+def _build_numbering_level_defs(doc: docx.Document):
+    """
+    掃過 numbering.xml，建立 (numId, ilvl) -> (numFmt, lvlText) 的對照表。
+    lvlOverride（若有自訂 numFmt / lvlText）優先於 abstractNum 的預設定義。
+    """
+    numbering_root = doc.part.numbering_part.element
+
+    num_to_abstract = {}
+    for num_el in numbering_root.findall(qn('w:num')):
+        num_id = num_el.get(qn('w:numId'))
+        abstract_el = num_el.find(qn('w:abstractNumId'))
+        if abstract_el is not None:
+            num_to_abstract[num_id] = abstract_el.get(qn('w:val'))
+
+    abstract_lvl_defs = {}
+    for abstract_el in numbering_root.findall(qn('w:abstractNum')):
+        abstract_id = abstract_el.get(qn('w:abstractNumId'))
+        lvl_map = {}
+        for lvl_el in abstract_el.findall(qn('w:lvl')):
+            ilvl = lvl_el.get(qn('w:ilvl'))
+            num_fmt_el = lvl_el.find(qn('w:numFmt'))
+            lvl_text_el = lvl_el.find(qn('w:lvlText'))
+            num_fmt = num_fmt_el.get(qn('w:val')) if num_fmt_el is not None else "decimal"
+            lvl_text = lvl_text_el.get(qn('w:val')) if lvl_text_el is not None else "%1."
+            lvl_map[ilvl] = (num_fmt, lvl_text)
+        abstract_lvl_defs[abstract_id] = lvl_map
+
+    num_lvl_overrides = {}
+    for num_el in numbering_root.findall(qn('w:num')):
+        num_id = num_el.get(qn('w:numId'))
+        overrides = {}
+        for lvl_override in num_el.findall(qn('w:lvlOverride')):
+            ilvl = lvl_override.get(qn('w:ilvl'))
+            lvl_el = lvl_override.find(qn('w:lvl'))
+            if lvl_el is not None:
+                num_fmt_el = lvl_el.find(qn('w:numFmt'))
+                lvl_text_el = lvl_el.find(qn('w:lvlText'))
+                if num_fmt_el is not None or lvl_text_el is not None:
+                    abstract_id = num_to_abstract.get(num_id)
+                    default_fmt, default_text = abstract_lvl_defs.get(abstract_id, {}).get(ilvl, ("decimal", "%1."))
+                    num_fmt = num_fmt_el.get(qn('w:val')) if num_fmt_el is not None else default_fmt
+                    lvl_text = lvl_text_el.get(qn('w:val')) if lvl_text_el is not None else default_text
+                    overrides[ilvl] = (num_fmt, lvl_text)
+        if overrides:
+            num_lvl_overrides[num_id] = overrides
+
+    def get_level_def(num_id: str, ilvl: str):
+        if num_id in num_lvl_overrides and ilvl in num_lvl_overrides[num_id]:
+            return num_lvl_overrides[num_id][ilvl]
+        abstract_id = num_to_abstract.get(num_id)
+        if abstract_id is not None and ilvl in abstract_lvl_defs.get(abstract_id, {}):
+            return abstract_lvl_defs[abstract_id][ilvl]
+        return ("decimal", "%1.")  # 查不到定義時的保守預設值
+
+    return get_level_def
+
+
+def normalize_and_solidify_list_numbering(doc: docx.Document):
+    """
+    問題根源：
+    Word 的自動編號清單（不管是 1./1.1、a./b./c.、i./ii./iii. 還是甲/乙/丙）
+    是由 w:numPr 搭配 numbering.xml 動態算出來「顯示」的，數字/文字本身
+    不存在於段落文字內容裡。Dify 解析 docx 抽取文字時只會拿到段落文字，
+    抓不到這個動態算出來的編號，導致使用者明明在 Word 裡打好了清單，
+    餵進 Dify 後編號卻整個消失。
+
+    解法：
+    依文件段落順序，自行計算每個編號段落目前所在的階層計數，
+    並依 numbering.xml 裡該層級真正定義的 w:numFmt（樣式，如
+    decimal/lowerLetter/lowerRoman/chineseCounting/taiwaneseCounting 等）
+    與 w:lvlText（樣板，如 "%1."、"(%2)"、"第%1章"）組出跟 Word 顯示
+    一致的文字，直接寫死插入段落文字最前面，然後移除該段落的 w:numPr，
+    讓 Word 自動編號機制不再接手顯示。
+
+    注意：這個函式一定要在 fix_list_indentation_for_libreoffice 之後執行，
+    因為縮排值已經在前一步被寫死到段落自己的 w:ind 上，
+    這裡移除 w:numPr 並不會影響排版縮排。
+    """
+    get_level_def = _build_numbering_level_defs(doc)
+    level_counters = {}
+
+    for p in doc.paragraphs:
+        pPr = p._p.get_or_add_pPr()
+        numPr = pPr.find(qn('w:numPr'))
+
+        if numPr is not None:
+            ilvl_elem = numPr.find(qn('w:ilvl'))
+            numId_elem = numPr.find(qn('w:numId'))
+            ilvl = ilvl_elem.get(qn('w:val')) if ilvl_elem is not None else '0'
+            num_id = numId_elem.get(qn('w:val')) if numId_elem is not None else None
+
+            ilvl_int = int(ilvl)
+            keys_to_del = [k for k in level_counters.keys() if k > ilvl_int]
+            for k in keys_to_del:
+                del level_counters[k]
+
+            own_fmt, own_lvl_text = get_level_def(num_id, ilvl)
+
+            if own_fmt == "bullet":
+                # 項目符號清單（不是編號清單）：不累加計數器、不套用格式轉換。
+                # Word 的 bullet lvlText 常常是 Wingdings / Symbol 字型底下的
+                # 私有區碼位（不是真的 Unicode "•"），脫離該字型直接照抄成
+                # 純文字會變成亂碼或方框符號，因此固定改用正常的「• 」代表。
+                prefix = "• "
+            else:
+                level_counters[ilvl_int] = level_counters.get(ilvl_int, 0) + 1
+
+                def _replace_placeholder(m, num_id=num_id):
+                    ref_ilvl_int = int(m.group(1)) - 1  # %1 對應 ilvl=0，%2 對應 ilvl=1，以此類推
+                    ref_count = level_counters.get(ref_ilvl_int, 1)
+                    ref_fmt, _ = get_level_def(num_id, str(ref_ilvl_int))
+                    return _format_counter(ref_count, ref_fmt)
+
+                prefix = re.sub(r'%(\d)', _replace_placeholder, own_lvl_text) + " "
+
+            text_content = p.text.strip()
+            has_hardcoded_number = re.match(r'^(\d+(\.\d+)*[\.、\)]|\(\d+\))', text_content)
+
+            if text_content and not has_hardcoded_number:
+                if p.runs:
+                    p.runs[0].text = prefix + p.runs[0].text
+                else:
+                    p.text = prefix + p.text
+
+            pPr.remove(numPr)
+
+
 def convert_docx_to_pdf(docx_path: Path, output_pdf_path: Path) -> Path:
     print(f"[PDF轉檔] 開始轉換 PDF: {docx_path.name}")
     try:
@@ -339,7 +556,7 @@ def delete_existing_document_and_clean_local(dataset_id: str, original_filename:
     查詢 Dify 知識庫中是否存在同名文件。
     若存在，會：
       1. 呼叫 Dify 刪除文件 API，把舊文件從知識庫移除
-      2. 解析其舊 UUID 並刪除本地三個資料夾對應的舊實體檔案
+      2. 解析其舊 UUID 並刪除本地 docx / pdf 兩個資料夾對應的舊實體檔案
     回傳是否有刪除到舊文件（True/False）。
 
     改為「刪除舊文件＋一律新增」而非「update-by-file」，
@@ -388,10 +605,10 @@ def delete_existing_document_and_clean_local(dataset_id: str, original_filename:
             if old_uuid:
                 print(f"[狀態查詢] 從 metadata 解析出舊檔案 UUID: {old_uuid}")
                 safe_unlink(PDF_DIR / f"{old_uuid}.pdf")
-                safe_unlink(DOCX_MODIFIED_DIR / f"{old_uuid}.docx")
-                safe_unlink(DOCX_ORIGINAL_DIR / f"{old_uuid}.docx")
+                safe_unlink(DOCX_DIR / f"{old_uuid}.docx")
             else:
                 # 退回舊機制：從 segment 內文用 regex 解析 PDF 網址取得 UUID
+                # （適用於舊版尚未寫入 metadata 的歷史文件）
                 print("[狀態查詢] metadata 中未找到 file_uuid，退回舊的內文解析機制。")
                 segments_url = f"{DIFY_API_BASE}/datasets/{dataset_id}/documents/{doc_id}/segments"
                 seg_res = requests.get(segments_url, headers=headers)
@@ -406,8 +623,7 @@ def delete_existing_document_and_clean_local(dataset_id: str, original_filename:
                             old_uuid = Path(old_pdf_filename).stem
                             print(f"[狀態查詢] 解析出舊檔案 UUID: {old_uuid}")
                             safe_unlink(PDF_DIR / old_pdf_filename)
-                            safe_unlink(DOCX_MODIFIED_DIR / f"{old_uuid}.docx")
-                            safe_unlink(DOCX_ORIGINAL_DIR / f"{old_uuid}.docx")
+                            safe_unlink(DOCX_DIR / f"{old_uuid}.docx")
                         else:
                             print("[狀態查詢] 警告：無法從舊文件的 segment 內容解析出 UUID。")
 
@@ -415,61 +631,6 @@ def delete_existing_document_and_clean_local(dataset_id: str, original_filename:
 
     print("[狀態查詢] 知識庫中未找到同名文件，將執行新增流程。")
     return False
-
-
-def normalize_and_solidify_list_numbering(doc: docx.Document):
-    """
-    1. 算出動態多層級數字 (1., 1.1., 1.3.1.) 並寫死進內文文字首位。
-    2. 刪除原本 Word XML 內的 w:numPr (動態縮排與編號標記)。
-    """
-    level_counters = {}
-
-    for p in doc.paragraphs:
-        pPr = p._p.get_or_add_pPr()
-        numPr = pPr.find(docx.oxml.ns.qn('w:numPr'))
-
-        if numPr is not None:
-            ilvl_elem = numPr.find(docx.oxml.ns.qn('w:ilvl'))
-            ilvl = int(ilvl_elem.get(docx.oxml.ns.qn('w:val'))) if ilvl_elem is not None else 0
-
-            keys_to_del = [k for k in level_counters.keys() if k > ilvl]
-            for k in keys_to_del:
-                del level_counters[k]
-
-            level_counters[ilvl] = level_counters.get(ilvl, 0) + 1
-
-            full_number_parts = [str(level_counters[i]) for i in range(ilvl + 1) if i in level_counters]
-            prefix = ".".join(full_number_parts) + " "
-
-            text_content = p.text.strip()
-            has_hardcoded_number = re.match(r'^(\d+(\.\d+)*[\.、\)]|\(\d+\))', text_content)
-
-            if text_content and not has_hardcoded_number:
-                if p.runs:
-                    p.runs[0].text = prefix + p.runs[0].text
-                else:
-                    p.text = prefix + p.text
-
-            pPr.remove(numPr)
-
-
-def inject_pdf_url_and_chunk_tag_safe(docx_path: Path, pdf_url: str, display_filename: str):
-    print(f"[Word注入] 開始實體化編號並注入 PDF 網址: {docx_path.name}")
-    doc = docx.Document(docx_path)
-
-    normalize_and_solidify_list_numbering(doc)
-
-    pdf_text = f"【資料來源 PDF】: [{display_filename}]({pdf_url})"
-
-    p_first = doc.paragraphs[0]
-    p_first.insert_paragraph_before("===CHUNK===")
-    p_first.insert_paragraph_before(pdf_text)
-    p_first.insert_paragraph_before("===CHUNK===")
-
-    doc.save(docx_path)
-    del doc
-    gc.collect()
-    print("[Word注入] 注入完成並儲存檔案。")
 
 
 async def wait_for_dify_indexing(dataset_id: str, document_id: str, headers: dict, max_retries: int = 60, delay: int = 5) -> dict:
@@ -481,9 +642,9 @@ async def wait_for_dify_indexing(dataset_id: str, document_id: str, headers: dic
             doc_info = response.json()
             doc_data = doc_info.get("document", doc_info)
             status = doc_data.get("indexing_status")
-            
+
             print(f"[狀態輪詢] 第 {i+1} 次檢查，目前狀態: {status}")
-            
+
             if status == "completed":
                 print("[狀態輪詢] 索引完成！")
                 return doc_info
@@ -492,16 +653,15 @@ async def wait_for_dify_indexing(dataset_id: str, document_id: str, headers: dic
                 return None
         else:
             print(f"[狀態輪詢] 請求失敗，狀態碼: {response.status_code}")
-            
+
         await asyncio.sleep(delay)
-        
+
     print("[狀態輪詢] 達到最大重試次數，索引發生超時。")
     return None
 
 
 @app.post("/upload-to-dify")
 async def process_and_upload_to_dify(file: UploadFile = File(...), dataset_id: str = Form(...)):
-    # 變更：將 HTTPException 改為回傳帶有 status: error 的 JSON 物件
     if not file.filename.endswith(".docx"):
         return {
             "status": "error",
@@ -514,30 +674,32 @@ async def process_and_upload_to_dify(file: UploadFile = File(...), dataset_id: s
 
     file_uuid = str(uuid.uuid4())
     print(f"[初始化] 生成新檔案 UUID: {file_uuid}")
-    
-    original_docx_path = DOCX_ORIGINAL_DIR / f"{file_uuid}.docx"
-    modified_docx_path = DOCX_MODIFIED_DIR / f"{file_uuid}.docx"
+
+    docx_path = DOCX_DIR / f"{file_uuid}.docx"
     pdf_path = PDF_DIR / f"{file_uuid}.pdf"
 
     try:
         file_bytes = await file.read()
-        with open(original_docx_path, "wb") as buffer:
+        with open(docx_path, "wb") as buffer:
             buffer.write(file_bytes)
-        with open(modified_docx_path, "wb") as buffer:
-            buffer.write(file_bytes)
-        print("[儲存檔案] 原始檔與處理檔已寫入本地儲存區。")
+        print("[儲存檔案] 使用者上傳檔已寫入本地儲存區，準備進行處理。")
 
-        doc_for_indent_fix = docx.Document(modified_docx_path)
-        fix_list_indentation_for_libreoffice(doc_for_indent_fix)
-        doc_for_indent_fix.save(modified_docx_path)
-        del doc_for_indent_fix
+        # 依序套用兩個處理，處理完直接存回同一份 docx_path：
+        # 1. 縮排修正：把編號段落該有的縮排值寫死到段落自己身上（供 LibreOffice 正確排版）
+        # 2. 編號硬寫：把 1. / 1.1 / 1.1.1 這種自動編號實體化成文字，並移除 w:numPr，
+        #    確保 Dify 抽取文字時看得到編號（順序必須在縮排修正之後，理由見函式註解）
+        # 這份處理後的文件會同時拿去轉 PDF 跟餵給 Dify，兩邊看到的編號內容完全一致。
+        doc_for_processing = docx.Document(docx_path)
+        fix_list_indentation_for_libreoffice(doc_for_processing)
+        normalize_and_solidify_list_numbering(doc_for_processing)
+        doc_for_processing.save(docx_path)
+        del doc_for_processing
         gc.collect()
+        print("[文件處理] 縮排修正與編號硬寫皆已完成並存回。")
 
-        convert_docx_to_pdf(modified_docx_path, pdf_path)
+        convert_docx_to_pdf(docx_path, pdf_path)
 
         pdf_url = f"{SERVER_BASE_URL}/static/pdf/{file_uuid}.pdf"
-
-        inject_pdf_url_and_chunk_tag_safe(modified_docx_path, pdf_url, original_filename)
 
         # 若知識庫中已有同名文件，先刪除舊文件並清掉對應的本地舊檔案，
         # 之後一律走「建立新文件」流程（不再用 update-by-file，
@@ -552,6 +714,8 @@ async def process_and_upload_to_dify(file: UploadFile = File(...), dataset_id: s
                         {"id": "remove_extra_spaces", "enabled": True},
                         {"id": "remove_urls_emails", "enabled": False}
                     ],
+                    # 沿用文件裡使用者手動打的 ===CHUNK=== 標記來切分 parent chunk
+                    # （這不是程式插入的，是原始文件內容本身就含有的分段標記）。
                     "segmentation": {
                         "separator": "===CHUNK===",
                         "max_tokens": 4000
@@ -573,13 +737,13 @@ async def process_and_upload_to_dify(file: UploadFile = File(...), dataset_id: s
             }
         }
 
-        with open(modified_docx_path, "rb") as docx_file:
+        with open(docx_path, "rb") as docx_file:
             files = {
                 "file": (original_filename, docx_file, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
                 "data": (None, json.dumps(data), "application/json")
             }
 
-            print("[Dify上傳] 開始呼叫 API 建立新文件")
+            print("[Dify上傳] 開始呼叫 API 建立新文件（使用縮排修正＋編號硬寫後的版本）")
             api_url = f"{DIFY_API_BASE}/datasets/{dataset_id}/document/create-by-file"
 
             response = requests.post(api_url, headers=headers, files=files)
@@ -594,8 +758,8 @@ async def process_and_upload_to_dify(file: UploadFile = File(...), dataset_id: s
         if not target_doc_id:
             raise Exception("無法從 Dify 回應中取得文件 ID")
 
-        # 新增：文件建立/更新成功後，把這次的 file_uuid、pdf_url 一起寫入該文件的 metadata，
-        # 之後要對照本地三個資料夾的檔案，就不用再靠內文 regex 解析。
+        # 文件建立成功後，把這次的 file_uuid、pdf_url 一起寫入該文件的 metadata，
+        # 之後要對照本地 docx / pdf 資料夾的檔案，就不用再靠內文 regex 解析。
         set_document_metadata(dataset_id, target_doc_id, file_uuid, pdf_url, headers)
 
         final_dify_response = await wait_for_dify_indexing(dataset_id, target_doc_id, headers)
@@ -610,15 +774,25 @@ async def process_and_upload_to_dify(file: UploadFile = File(...), dataset_id: s
                 "dify_response": final_dify_response
             }
         else:
+            # 索引失敗：主動呼叫 Dify API 刪除這筆失敗的文件，避免殘留
+            print(f"[清理機制] 索引失敗，準備從 Dify 知識庫移除文件 ID: {target_doc_id}")
+            delete_url = f"{DIFY_API_BASE}/datasets/{dataset_id}/documents/{target_doc_id}"
+            try:
+                del_res = requests.delete(delete_url, headers=headers)
+                if del_res.status_code in (200, 204):
+                    print(f"[清理機制] 已成功從 Dify 知識庫移除失敗文件: {target_doc_id}")
+                else:
+                    print(f"[清理機制] 從 Dify 移除失敗文件失敗，狀態碼: {del_res.status_code}")
+            except Exception as clean_err:
+                print(f"[清理機制] 移除文件時發生例外: {str(clean_err)}")
+
             raise Exception("Dify 索引失敗或發生超時錯誤")
 
     except Exception as e:
         print(f"\n[錯誤處理] 流程發生例外，清理本次產生的暫存檔，錯誤內容: {str(e)}")
-        safe_unlink(original_docx_path)
-        safe_unlink(modified_docx_path)
+        safe_unlink(docx_path)
         safe_unlink(pdf_path)
         print("========== 錯誤處理執行完畢 ==========\n")
-        # 變更：移除 raise HTTPException，改回傳 JSON 讓 Dify 判讀
         return {
             "status": "error",
             "detail": str(e)
