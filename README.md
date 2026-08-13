@@ -133,50 +133,31 @@ docker logs -f dify-upload-word-service
 
 當發送 POST 請求至 `/upload-to-dify` 端點時，`app.py` 會依序執行以下自動化流程：
 
-1. **檔案接收與隔離儲存 (`/storage`)**：
-* 產生全域唯一識別碼 (`file_uuid`)。
+1. **檔案格式檢查與初始化**：
+   * 檢查檔案副檔名是否為 `.docx`。
+   * 使用 `uuid.uuid4()` 生成全域唯一識別碼 (`file_uuid`) 作為後續本地檔案儲存檔名。
+   * 將上傳的檔案暫存至 `storage/docx/{file_uuid}.docx`。
 
-
-* 將原始 Word 寫入 `storage/docx_original/`，修改用副本寫入 `storage/docx_modified/`。
-
-
-
-
-2. **Word 縮排與編號修正**：
-* `fix_list_indentation_for_libreoffice()`：修復 Word XML 的 `w:leftChars` 屬性，防止 LibreOffice 轉檔時縮排貼齊左邊界。
-
-
-* `normalize_and_solidify_list_numbering()`：將動態階層編號（如 1.1, 1.1.1）寫死為實體文字，並移除 XML 中的 `w:numPr` 標記。
-
-
-
+2. **Word 文件內容修正（核心雙步驟）**：
+   * `fix_list_indentation_for_libreoffice()`：修正 Word XML 的 `w:leftChars` 屬性，將 `numbering.xml` 真正定義的縮排數值寫死至段落自身的 `w:ind` 上，防止 LibreOffice 轉檔時縮排全部貼齊左邊界。
+   * `normalize_and_solidify_list_numbering()`：
+     * 依據段落順序與清單識別碼，維護 `(num_id, ilvl)` 複合鍵計數器（以 `num_id` 隔離不同清單，避免同層級的不同獨立清單相互干擾造成編號偏移，如 `a.` 誤變成 `b.`）。
+     * 解析 `numbering.xml` 中的樣式樣板（`w:numFmt` 與 `w:lvlText`），將動態算出的階層編號轉為靜態文字寫死在段落文字最前端。
+     * 移除段落中的動態編號標記 `<w:numPr>`，防止 Word 或 LibreOffice 重複繪製編號。
+   * **儲存檔案**：修正後的內容會直接覆蓋存回 `storage/docx/{file_uuid}.docx`（本服務不另外保存未處理的原始檔）。
 
 3. **PDF 轉檔與靜態掛載**：
-* 呼叫系統內建 LibreOffice Headless 模式，將修正後的 Word 轉為 PDF 並存入 `storage/pdf/`。
+   * 呼叫系統內建 LibreOffice Headless 模式，將修正後的 Word 轉為 PDF 並存入 `storage/pdf/{file_uuid}.pdf`。
+   * FastAPI 以 `/static/pdf/` 路由掛載該目錄供外部存取預覽，確保外部無法存取與下載原始 Word 檔。
 
+4. **Dify 舊檔清理** (`delete_existing_document_and_clean_local`)：
+   * 向 Dify 查詢該知識庫中是否已有同名文件。
+   * 若存在舊檔，先刪除 Dify 上的該筆文件，並利用 metadata（或內文解析）找出舊 UUID，同時刪除本地對應的舊 `.docx` 與 `.pdf` 實體檔案，確保每一次上傳都是 Clean State。
 
-* FastAPI 以 `/static/pdf/` 路由掛載該目錄，外部僅能存取 PDF，保護原始 Word 檔不外洩。
+5. **上傳至 Dify 知識庫 (Hierarchical)**：
+   * 將處理後的 Word 檔透過 `create-by-file` 端點上傳至 Dify。
+   * 設定為父子層級模式 (`hierarchical_model`)，並沿用文件內使用者手動標註的 `===CHUNK===` 進行父切塊分割。
 
-
-
-
-4. **Chunk 標記與 PDF 網址注入**：
-* 在 Word 文件頂端注入 `【資料來源 PDF】: [檔名](SERVER_BASE_URL/static/pdf/uuid.pdf)` 與 `===CHUNK===` 自訂切割標記。
-
-
-
-
-5. **Dify 舊檔清理與階層式索引 (Hierarchical)**：
-* `delete_existing_document_and_clean_local()`：檢查知識庫，若存在同名文件則先執行刪除並清理本地舊檔，確保每次以 Clean State 建立。
-
-
-* 呼叫 Dify API，以父子分段模式（Hierarchical Model）建立新文件。
-
-
-
-
-6. **Metadata 自動回寫與輪詢**：
-* 動態查詢並快取 `file_uuid` 與 `pdf_url` 的欄位 ID，回寫至該 Dify 文件的元數據。
-
-
-* 定期輪詢 Dify 索引狀態直至 `completed`。
+6. **Metadata 自動回寫與狀態輪詢**：
+   * `set_document_metadata()`：動態查詢並快取 `file_uuid` 與 `pdf_url` 的欄位 ID，將資訊合併寫入該 Dify 文件的元數據。
+   * `wait_for_dify_indexing()`：定期輪詢 Dify 索引狀態直至 `completed`。若索引失敗或超時，會主動向 Dify 請求刪除該新建文件並清理本地暫存檔。
