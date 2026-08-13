@@ -479,11 +479,20 @@ def normalize_and_solidify_list_numbering(doc: docx.Document):
             num_id = numId_elem.get(qn('w:val')) if numId_elem is not None else None
 
             ilvl_int = int(ilvl)
-            keys_to_del = [k for k in level_counters.keys() if k > ilvl_int]
+            # 計數器的 key 必須是 (numId, ilvl) 而不是單純 ilvl。
+            # 原因：文件中常常有多份「不同的」清單各自都是從 ilvl=0 開始
+            # （例如一份是章節標題的自動編號 numId=2，另一份是段落內文的
+            # a./b./c. 清單 numId=4），兩者剛好同層級但彼此獨立、互不相干。
+            # 若只用 ilvl 當 key，後面出現的清單會誤繼承前一份不相關清單
+            # 留下的計數，導致整組編號/字母莫名往後平移（例如 a,b,c 被誤判
+            # 接續前面清單的計數，變成從 b,c,d 開始）。
+            # 子層重置邏輯也要限定同一個 numId，避免刪到其他清單的計數。
+            keys_to_del = [k for k in level_counters.keys() if k[0] == num_id and k[1] > ilvl_int]
             for k in keys_to_del:
                 del level_counters[k]
 
             own_fmt, own_lvl_text = get_level_def(num_id, ilvl)
+            counter_key = (num_id, ilvl_int)
 
             if own_fmt == "bullet":
                 # 項目符號清單（不是編號清單）：不累加計數器、不套用格式轉換。
@@ -492,11 +501,11 @@ def normalize_and_solidify_list_numbering(doc: docx.Document):
                 # 純文字會變成亂碼或方框符號，因此固定改用正常的「• 」代表。
                 prefix = "• "
             else:
-                level_counters[ilvl_int] = level_counters.get(ilvl_int, 0) + 1
+                level_counters[counter_key] = level_counters.get(counter_key, 0) + 1
 
                 def _replace_placeholder(m, num_id=num_id):
                     ref_ilvl_int = int(m.group(1)) - 1  # %1 對應 ilvl=0，%2 對應 ilvl=1，以此類推
-                    ref_count = level_counters.get(ref_ilvl_int, 1)
+                    ref_count = level_counters.get((num_id, ref_ilvl_int), 1)
                     ref_fmt, _ = get_level_def(num_id, str(ref_ilvl_int))
                     return _format_counter(ref_count, ref_fmt)
 
