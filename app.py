@@ -183,6 +183,87 @@ def get_file_uuid_from_metadata(doc: dict) -> str:
 
 
 # ============================================================
+# 取得段落「實際生效」的自動編號 (numId / ilvl)
+#
+# 問題背景：
+# Word 的自動編號清單有兩種掛法：
+#   1) 編號直接掛在段落自己的 w:pPr/w:numPr 上
+#   2) 編號掛在該段落套用的「樣式」上（styles.xml 裡該 style 的
+#      w:pPr/w:numPr），段落本身完全沒有 w:numPr，是靠套用樣式
+#      繼承來的編號
+# 舊版程式只檢查第 1 種情況，導致像「內文-數字標示」這類靠樣式
+# 繼承編號的段落，自動編號完全沒被抓到、也就沒被硬寫成文字。
+# ============================================================
+def _get_style_numpr(doc: docx.Document, style_id: str, visited=None):
+    """
+    往上查某個 style 是否有 w:numPr；若自己沒有，沿著 w:basedOn 鏈
+    繼續往上層樣式找（Word 的樣式繼承機制）。
+    回傳 (numId, ilvl) 或 None。
+    """
+    if visited is None:
+        visited = set()
+    if not style_id or style_id in visited:
+        return None
+    visited.add(style_id)
+
+    for s in doc.styles.element.findall(qn('w:style')):
+        if s.get(qn('w:styleId')) == style_id:
+            pPr = s.find(qn('w:pPr'))
+            if pPr is not None:
+                numPr = pPr.find(qn('w:numPr'))
+                if numPr is not None:
+                    ilvl_el = numPr.find(qn('w:ilvl'))
+                    numId_el = numPr.find(qn('w:numId'))
+                    ilvl = ilvl_el.get(qn('w:val')) if ilvl_el is not None else '0'
+                    num_id = numId_el.get(qn('w:val')) if numId_el is not None else None
+                    if num_id is not None:
+                        return (num_id, ilvl)
+                basedOn = pPr.find(qn('w:basedOn'))
+                if basedOn is not None:
+                    return _get_style_numpr(doc, basedOn.get(qn('w:val')), visited)
+            return None
+    return None
+
+
+def get_effective_numpr(doc: docx.Document, p):
+    """
+    取得段落「實際生效」的編號來源，優先序：
+      段落自己的 w:numPr  >  段落套用樣式（含 basedOn 繼承鏈）的 w:numPr
+    回傳 (num_id, ilvl, is_direct)，is_direct=True 代表編號是直接掛在
+    段落自己身上（段落的 w:numPr 節點可以直接刪除來取消編號）；
+    is_direct=False 代表編號是樣式繼承來的（段落本身沒有 w:numPr 節點
+    可刪，必須額外「明確覆蓋成 numId=0」才能取消繼承的編號）。
+    查無任何編號（含 numId=0 代表本來就已停用）則回傳 None。
+    """
+    pPr = p._p.pPr
+    if pPr is not None:
+        numPr = pPr.find(qn('w:numPr'))
+        if numPr is not None:
+            ilvl_el = numPr.find(qn('w:ilvl'))
+            numId_el = numPr.find(qn('w:numId'))
+            ilvl = ilvl_el.get(qn('w:val')) if ilvl_el is not None else '0'
+            num_id = numId_el.get(qn('w:val')) if numId_el is not None else None
+            if num_id is not None and num_id != '0':
+                return (num_id, ilvl, True)
+            if num_id == '0':
+                return None  # 段落自己明確關閉編號，不該再往樣式查
+
+    style_id = None
+    if pPr is not None:
+        pStyle = pPr.find(qn('w:pStyle'))
+        style_id = pStyle.get(qn('w:val')) if pStyle is not None else None
+    if style_id is None and p.style is not None:
+        style_id = p.style.style_id
+
+    style_result = _get_style_numpr(doc, style_id)
+    if style_result is not None:
+        num_id, ilvl = style_result
+        if num_id != '0':
+            return (num_id, ilvl, False)
+    return None
+
+
+# ============================================================
 # 修正 w:leftChars 造成的 LibreOffice 縮排跑版問題（完全保留未動）
 #
 # 執行順序很重要：這個函式一定要在 normalize_and_solidify_list_numbering
@@ -254,21 +335,14 @@ def fix_list_indentation_for_libreoffice(doc: docx.Document):
     fixed_count = 0
 
     for p in doc.paragraphs:
-        pPr = p._p.pPr
-        if pPr is None:
-            continue
+        # 改用 get_effective_numpr：不只看段落自己的 w:numPr，
+        # 也涵蓋編號掛在「樣式」上、段落靠套用樣式繼承編號的情況。
+        result = get_effective_numpr(doc, p)
+        if result is None:
+            continue  # 沒有自動編號（無論直接掛還是樣式繼承），跳過，不動它的縮排
+        num_id, ilvl, is_direct = result
 
-        numPr = pPr.find(qn('w:numPr'))
-        if numPr is None:
-            continue  # 沒有自動編號，跳過，不動它的縮排
-
-        ilvl_el = numPr.find(qn('w:ilvl'))
-        numId_el = numPr.find(qn('w:numId'))
-        if numId_el is None:
-            continue
-
-        ilvl = ilvl_el.get(qn('w:val')) if ilvl_el is not None else '0'
-        num_id = numId_el.get(qn('w:val'))
+        pPr = p._p.get_or_add_pPr()
 
         # 優先找 lvlOverride，其次找 abstractNum 預設層級縮排
         left = hanging = None
@@ -443,50 +517,52 @@ def _build_numbering_level_defs(doc: docx.Document):
 
     return get_level_def
 
-
 def normalize_and_solidify_list_numbering(doc: docx.Document):
     """
-    問題根源：
-    Word 的自動編號清單（不管是 1./1.1、a./b./c.、i./ii./iii. 還是甲/乙/丙）
-    是由 w:numPr 搭配 numbering.xml 動態算出來「顯示」的，數字/文字本身
-    不存在於段落文字內容裡。Dify 解析 docx 抽取文字時只會拿到段落文字，
-    抓不到這個動態算出來的編號，導致使用者明明在 Word 裡打好了清單，
-    餵進 Dify 後編號卻整個消失。
+    將 Word 動態編號實體化成文字。
 
-    解法：
-    依文件段落順序，自行計算每個編號段落目前所在的階層計數，
-    並依 numbering.xml 裡該層級真正定義的 w:numFmt（樣式，如
-    decimal/lowerLetter/lowerRoman/chineseCounting/taiwaneseCounting 等）
-    與 w:lvlText（樣板，如 "%1."、"(%2)"、"第%1章"）組出跟 Word 顯示
-    一致的文字，直接寫死插入段落文字最前面，然後移除該段落的 w:numPr，
-    讓 Word 自動編號機制不再接手顯示。
+    重要修正（2026-08，第一輪）：
+    編號來源分兩種——直接掛在段落自己的 w:numPr，或是繼承自段落套用的
+    「樣式」(styles.xml 裡該 style 的 w:numPr)。過去版本在「繼承自樣式」
+    的情況下，抓到的 numPr 節點其實是樣式本身共用的節點，處理完後又把它
+    整個刪除，等於直接破壞了樣式定義——導致同一個樣式底下，只有第一個
+    段落被正確編號，後面所有共用該樣式的段落全部失去編號（因為樣式的
+    numPr 已經被上一個段落刪光了）。
+    現在改用 get_effective_numpr 統一查找（不會動到樣式本身），並且
+    「取消編號」一律透過在段落自己身上明確寫入 numId="0" 來完成
+    （OOXML 規範：段落自己的 numId=0 代表關閉編號，且只影響這一個段落，
+    不會動到樣式或其他共用該樣式的段落）。
 
-    注意：這個函式一定要在 fix_list_indentation_for_libreoffice 之後執行，
-    因為縮排值已經在前一步被寫死到段落自己的 w:ind 上，
-    這裡移除 w:numPr 並不會影響排版縮排。
+    重要修正（2026-08，第二輪）：
+    每個 numId 各自代表一份「獨立」的清單，彼此的計數應該互不影響。
+    舊版有一段「切換到不同 numId 且在第 0 層時，就把 level_counters 整個
+    清空」的邏輯，原意可能是想在切換清單時重置計數，但它是「不分青紅皂白
+    清空全部 numId 的計數」，一旦文件中間夾雜了一份不相關的清單（例如本例
+    中，標題自動編號 numId=14 的中間，插入了一份項目符號清單 numId=8），
+    就會把完全不相關的 numId=14 的計數也一併洗掉，導致後續編號從頭重算、
+    整個跑掉（例如子項目重複編號、父層級的編號不會往下遞增）。
+    現在拿掉這段「跨 numId 全部清空」的邏輯：每個 (numId, ilvl) 的計數器
+    完全獨立累加，只有在「同一個 numId」內，出現較淺層級的段落時，才清掉
+    該 numId 自己「更深層」的計數（這部分維持原本邏輯，是正確的）。
     """
     get_level_def = _build_numbering_level_defs(doc)
+
+    # 記錄各 numId 當前的階層計數：(numId, ilvl) -> count
+    # 每個 numId 完全獨立，不會因為文件中出現了別的 numId 而被互相影響。
     level_counters = {}
 
+    processed_count = 0
+
     for p in doc.paragraphs:
-        pPr = p._p.get_or_add_pPr()
-        numPr = pPr.find(qn('w:numPr'))
+        result = get_effective_numpr(doc, p)
 
-        if numPr is not None:
-            ilvl_elem = numPr.find(qn('w:ilvl'))
-            numId_elem = numPr.find(qn('w:numId'))
-            ilvl = ilvl_elem.get(qn('w:val')) if ilvl_elem is not None else '0'
-            num_id = numId_elem.get(qn('w:val')) if numId_elem is not None else None
-
+        if result is not None:
+            num_id, ilvl, is_direct = result
             ilvl_int = int(ilvl)
-            # 計數器的 key 必須是 (numId, ilvl) 而不是單純 ilvl。
-            # 原因：文件中常常有多份「不同的」清單各自都是從 ilvl=0 開始
-            # （例如一份是章節標題的自動編號 numId=2，另一份是段落內文的
-            # a./b./c. 清單 numId=4），兩者剛好同層級但彼此獨立、互不相干。
-            # 若只用 ilvl 當 key，後面出現的清單會誤繼承前一份不相關清單
-            # 留下的計數，導致整組編號/字母莫名往後平移（例如 a,b,c 被誤判
-            # 接續前面清單的計數，變成從 b,c,d 開始）。
-            # 子層重置邏輯也要限定同一個 numId，避免刪到其他清單的計數。
+
+            # 清理「同一個 numId」底下、比目前層級更深的子層計數
+            # （例如從 1.1.3 回到 1.2 時，要把原本 ilvl=2 的計數清掉，
+            #  下次再進到 ilvl=2 才會從 1 重新算起；但完全不影響其他 numId）
             keys_to_del = [k for k in level_counters.keys() if k[0] == num_id and k[1] > ilvl_int]
             for k in keys_to_del:
                 del level_counters[k]
@@ -495,33 +571,53 @@ def normalize_and_solidify_list_numbering(doc: docx.Document):
             counter_key = (num_id, ilvl_int)
 
             if own_fmt == "bullet":
-                # 項目符號清單（不是編號清單）：不累加計數器、不套用格式轉換。
-                # Word 的 bullet lvlText 常常是 Wingdings / Symbol 字型底下的
-                # 私有區碼位（不是真的 Unicode "•"），脫離該字型直接照抄成
-                # 純文字會變成亂碼或方框符號，因此固定改用正常的「• 」代表。
                 prefix = "• "
             else:
                 level_counters[counter_key] = level_counters.get(counter_key, 0) + 1
 
-                def _replace_placeholder(m, num_id=num_id):
-                    ref_ilvl_int = int(m.group(1)) - 1  # %1 對應 ilvl=0，%2 對應 ilvl=1，以此類推
-                    ref_count = level_counters.get((num_id, ref_ilvl_int), 1)
-                    ref_fmt, _ = get_level_def(num_id, str(ref_ilvl_int))
+                def _replace_placeholder(m, current_num_id=num_id):
+                    ref_ilvl_int = int(m.group(1)) - 1
+                    ref_count = level_counters.get((current_num_id, ref_ilvl_int), 1)
+                    ref_fmt, _ = get_level_def(current_num_id, str(ref_ilvl_int))
                     return _format_counter(ref_count, ref_fmt)
 
                 prefix = re.sub(r'%(\d)', _replace_placeholder, own_lvl_text) + " "
 
             text_content = p.text.strip()
-            has_hardcoded_number = re.match(r'^(\d+(\.\d+)*[\.、\)]|\(\d+\))', text_content)
 
-            if text_content and not has_hardcoded_number:
+            # 放寬正則判斷，確保動態編號能順利寫入段落最前面
+            if text_content:
                 if p.runs:
-                    p.runs[0].text = prefix + p.runs[0].text
+                    # 清掉第一個 run 開頭原本就存在的空白（例如使用者手滑多打的
+                    # 前導空格），避免跟編號後面自帶的空格疊成雙空格。
+                    # 只去掉最前面的空白字元本身，不影響後面文字內容。
+                    p.runs[0].text = prefix + p.runs[0].text.lstrip(' \u3000')
                 else:
-                    p.text = prefix + p.text
+                    new_run = p.add_run(prefix)
+                    p._p.remove(new_run._r)
+                    p._p.insert(0, new_run._r)
 
-            pPr.remove(numPr)
+                processed_count += 1
 
+            # 取消這個段落的編號：
+            # - 若編號是直接掛在段落自己的 w:numPr，直接移除該節點即可。
+            # - 若編號是繼承自樣式，段落自己並沒有 w:numPr 節點可刪，
+            #   必須明確新增一個 numId="0" 的 w:numPr 覆蓋掉繼承的編號，
+            #   絕不能去動樣式本身的 w:numPr（那是共用資源）。
+            pPr = p._p.get_or_add_pPr()
+            existing_numPr = pPr.find(qn('w:numPr'))
+            if is_direct:
+                if existing_numPr is not None:
+                    pPr.remove(existing_numPr)
+            else:
+                if existing_numPr is not None:
+                    pPr.remove(existing_numPr)
+                override_numPr = pPr.makeelement(qn('w:numPr'), {})
+                override_numId = pPr.makeelement(qn('w:numId'), {qn('w:val'): '0'})
+                override_numPr.append(override_numId)
+                pPr.insert(0, override_numPr)
+
+    print(f"[編號硬寫] 成功將 {processed_count} 個自動編號段落實體化為純文字")
 
 def convert_docx_to_pdf(docx_path: Path, output_pdf_path: Path) -> Path:
     print(f"[PDF轉檔] 開始轉換 PDF: {docx_path.name}")
